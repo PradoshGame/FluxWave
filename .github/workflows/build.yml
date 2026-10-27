@@ -1,0 +1,141 @@
+name: Automated Build
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  DOTNET_VERSION: '10.0.x'
+  PROJECT: '.'
+  APP_NAME: ${{ github.event.repository.name }}
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  # ---------------------------------------------------------------
+  # Standalone builds: self-contained, single file, no .NET needed
+  # ---------------------------------------------------------------
+  standalone:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rid: [win-x64, win-arm64, linux-x64, linux-arm64, osx-x64, osx-arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Publish (${{ matrix.rid }})
+        run: |
+          dotnet publish "$PROJECT" \
+            -c Release \
+            -r ${{ matrix.rid }} \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:IncludeNativeLibrariesForSelfExtract=true \
+            -p:DebugType=None -p:DebugSymbols=false \
+            -o out
+
+      - name: Package
+        run: |
+          NAME="${APP_NAME}-${{ matrix.rid }}"
+          mkdir -p dist
+          if [[ "${{ matrix.rid }}" == win-* ]]; then
+            (cd out && zip -r "../dist/$NAME.zip" .)
+          else
+            tar -czf "dist/$NAME.tar.gz" -C out .
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: standalone-${{ matrix.rid }}
+          path: dist/*
+
+  # ---------------------------------------------------------------
+  # Portable build: small, runs anywhere that has the .NET runtime
+  # ---------------------------------------------------------------
+  portable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Publish (framework-dependent)
+        run: |
+          dotnet publish "$PROJECT" -c Release \
+            -p:DebugType=None -p:DebugSymbols=false -o out
+          mkdir -p dist
+          (cd out && zip -r "../dist/${APP_NAME}-portable.zip" .)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portable
+          path: dist/*
+
+  # ---------------------------------------------------------------
+  # Hash everything and publish a pre-release marked as automated
+  # ---------------------------------------------------------------
+  release:
+    needs: [standalone, portable]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate hashes
+        working-directory: dist
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          sha512sum $(ls | grep -v -E 'SHA(256|512)SUMS.txt') > SHA512SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          TAG="auto-${GITHUB_RUN_NUMBER}-${SHORT_SHA}"
+
+          {
+            echo "## 🤖 Automated build"
+            echo
+            echo "This release was generated automatically by GitHub Actions from a commit. It has not been manually tested or reviewed."
+            echo
+            echo "- **Commit:** \`${GITHUB_SHA}\`"
+            echo "- **Branch:** \`${GITHUB_REF_NAME}\`"
+            echo "- **Build number:** ${GITHUB_RUN_NUMBER}"
+            echo
+            echo "**Commit message:**"
+            echo
+            echo '```'
+            echo "$COMMIT_MSG"
+            echo '```'
+            echo
+            echo "### SHA-256 hashes"
+            echo
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+            echo
+            echo "Standalone builds need nothing installed. The \`portable\` build needs the .NET runtime."
+          } > notes.md
+
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Automated build #${GITHUB_RUN_NUMBER} (${SHORT_SHA})" \
+            --notes-file notes.md \
+            --prerelease
